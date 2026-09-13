@@ -103,4 +103,64 @@ void main() {
     await tester.pump(const Duration(seconds: 4));
     await tester.pumpAndSettle();
   });
+
+  testWidgets('carriage-return progress collapses to its newest frame', (
+    tester,
+  ) async {
+    const stdout =
+        'Updating files:  55% (1461/2634)\r'
+        'Updating files: 100% (2634/2634), done.';
+
+    await tester.pumpWidget(
+      _harness(
+        child: WorkspaceToolDetailBody(
+          part: _shellPart(command: 'git checkout main', stdout: stdout),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    expect(find.textContaining('\r'), findsNothing);
+    expect(
+      find.text('Updating files: 100% (2634/2634), done.'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('55%'), findsNothing);
+  });
+
+  testWidgets('copied output replays carriage returns', (tester) async {
+    String? copied;
+    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      SystemChannels.platform,
+      (call) async {
+        if (call.method == 'Clipboard.setData') {
+          copied = (call.arguments as Map<Object?, Object?>)['text'] as String?;
+          return null;
+        }
+        return null;
+      },
+    );
+    addTearDown(() {
+      tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        null,
+      );
+    });
+
+    await tester.pumpWidget(
+      _harness(
+        child: WorkspaceToolDetailBody(
+          part: _shellPart(command: 'curl -O', stdout: '10%\r20%\r30%'),
+        ),
+      ),
+    );
+    await tester.pump();
+
+    await tester.tap(find.byTooltip('Copy output'));
+    await tester.pump();
+    expect(copied, 'curl -O\n30%');
+
+    await tester.pump(const Duration(seconds: 4));
+    await tester.pumpAndSettle();
+  });
 }

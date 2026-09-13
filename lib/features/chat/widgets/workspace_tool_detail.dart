@@ -18,6 +18,7 @@ import 'package:Kelivo/shared/widgets/ios_tactile.dart';
 import 'package:Kelivo/shared/widgets/ios_tile_button.dart';
 import 'package:Kelivo/shared/widgets/snackbar.dart';
 import 'package:Kelivo/theme/app_font_weights.dart';
+import 'package:Kelivo/utils/terminal_text.dart';
 
 import 'tool_detail_text_section.dart';
 import 'unified_diff_view.dart';
@@ -127,8 +128,8 @@ String _detailCopyText(
   final command = workspaceCommandOf(part, meta: meta, run: run);
   final path = workspacePathOf(part, meta: meta);
   final stdout = (run?.stdoutSoFar.isNotEmpty == true)
-      ? run!.stdoutSoFar
-      : (meta?.stdoutPreview ?? part.content ?? '');
+      ? normalizeTerminalText(run!.stdoutSoFar)
+      : normalizeTerminalText(meta?.stdoutPreview ?? part.content ?? '');
   final error = workspaceErrorMessage(part, meta) ?? '';
   final diff = meta?.diff ?? '';
   final buf = StringBuffer();
@@ -267,14 +268,14 @@ class _UnifiedDetailState extends State<_UnifiedDetail> {
 
   String get _stdout {
     final live = widget.run?.stdoutSoFar ?? '';
-    if (live.isNotEmpty) return live;
-    return _meta?.stdoutPreview ?? '';
+    if (live.isNotEmpty) return normalizeTerminalText(live);
+    return normalizeTerminalText(_meta?.stdoutPreview ?? '');
   }
 
   String get _stderr {
     final live = widget.run?.stderrSoFar ?? '';
-    if (live.isNotEmpty) return live;
-    return _meta?.stderrPreview ?? '';
+    if (live.isNotEmpty) return normalizeTerminalText(live);
+    return normalizeTerminalText(_meta?.stderrPreview ?? '');
   }
 
   String get _textResult {

@@ -6,6 +6,7 @@ import 'package:flutter/painting.dart';
 
 import '../../../shared/widgets/markdown_line_lexer.dart';
 import '../../../utils/mcp_structured_image.dart';
+import '../../../utils/terminal_text.dart';
 import '../../home/services/ask_user_interaction_service.dart';
 import '../../home/services/local_tools_service.dart';
 import 'screen_time_tool_ui.dart';
@@ -536,12 +537,14 @@ int _workspaceEstimateTailLineCount(
 ) {
   final preview = _workspaceMetaString(metadata, 'stdoutPreview');
   final stderr = _workspaceMetaString(metadata, 'stderrPreview');
-  final text = preview.isNotEmpty
+  final raw = preview.isNotEmpty
       ? preview
       : (stderr.isNotEmpty ? stderr : (content ?? ''));
-  if (text.isEmpty) return 0;
+  if (raw.isEmpty) return 0;
+  // The card shows the replayed tail, so a `\r` progress line counts once
+  // instead of once per frame.
   final lines = const LineSplitter()
-      .convert(text)
+      .convert(normalizeTerminalText(raw))
       .where((line) => line.isNotEmpty)
       .toList();
   if (lines.isEmpty) return 0;

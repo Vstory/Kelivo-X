@@ -63,6 +63,44 @@ void main() {
     expect(run.stderrSoFar, contains('err59'));
   });
 
+  test('replays carriage-return progress as one live tail line', () {
+    final run = ToolRun(toolCallId: 'c4', toolName: 'shell');
+
+    run.appendStdout(Uint8List.fromList(utf8.encode('Updating files:  55%\r')));
+    expect(run.tailLines, ['Updating files:  55%']);
+
+    run.appendStdout(Uint8List.fromList(utf8.encode('Updating files:  56%\r')));
+    expect(run.tailLines, ['Updating files:  56%']);
+
+    run.appendStdout(
+      Uint8List.fromList(utf8.encode('Updating files: 100%, done.\n')),
+    );
+    expect(run.tailLines, ['Updating files: 100%, done.']);
+    expect(run.stdoutSoFar, contains('55%'));
+  });
+
+  test('keeps carriage-return frames apart when they are on real lines', () {
+    final run = ToolRun(toolCallId: 'c5', toolName: 'shell');
+    run.appendStdout(Uint8List.fromList(utf8.encode('a\r\nb\r\nc')));
+    run.complete(status: ToolRunStatus.succeeded, exitCode: 0);
+    expect(run.tailLines, ['a', 'b', 'c']);
+  });
+
+  test('flushes an unterminated progress line on complete', () {
+    final run = ToolRun(toolCallId: 'c6', toolName: 'shell');
+    run.appendStdout(Uint8List.fromList(utf8.encode('10%\r20%\r')));
+    run.complete(status: ToolRunStatus.succeeded, exitCode: 0);
+    expect(run.tailLines, ['20%']);
+  });
+
+  test('bounds the raw tail of a line that never ends', () {
+    final run = ToolRun(toolCallId: 'c7', toolName: 'shell');
+    run.appendStdout(Uint8List.fromList(utf8.encode('${'x' * 70000}END')));
+    final tail = run.tailLines.last;
+    expect(tail.length, lessThanOrEqualTo(ToolRun.maxCarryChars));
+    expect(tail.endsWith('END'), isTrue);
+  });
+
   test(
     'identical provider tool IDs remain independent across conversations',
     () {
