@@ -3,6 +3,7 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
+import '../../../utils/terminal_text.dart';
 import 'output_buffer.dart';
 
 enum ToolRunStatus { running, succeeded, failed, cancelled, timedOut }
@@ -38,7 +39,26 @@ class ToolRun extends ChangeNotifier {
   static const int maxTailLines = 200;
   static const Duration notifyInterval = Duration(milliseconds: 50);
 
-  List<String> get tailLines => List<String>.unmodifiable(_tailLines);
+  /// Upper bound for the raw tail of a line that `\n` has not terminated yet.
+  /// Progress output repaints a single line with `\r` and may never emit a
+  /// newline, so the oldest bytes are dropped instead of kept for the run.
+  static const int maxCarryChars = 64 * 1024;
+
+  /// The committed lines, plus the unterminated line replayed to its newest
+  /// frame. Without that replay a progress bar piles up every frame it drew,
+  /// because each frame is separated by `\r` rather than by `\n`.
+  List<String> get tailLines {
+    if (_lineCarry.isEmpty) return List<String>.unmodifiable(_tailLines);
+    final carried = normalizeTerminalText(_lineCarry);
+    if (carried.isEmpty) return List<String>.unmodifiable(_tailLines);
+    final first = _tailLines.length >= maxTailLines
+        ? _tailLines.length - maxTailLines + 1
+        : 0;
+    return List<String>.unmodifiable(<String>[
+      ..._tailLines.sublist(first),
+      carried,
+    ]);
+  }
 
   String get stdoutSoFar => _stdout.text;
 
@@ -73,23 +93,33 @@ class ToolRun extends ChangeNotifier {
 
   void _feedTail(List<int> bytes) {
     final chunk = utf8.decode(bytes, allowMalformed: true);
+    if (chunk.isEmpty) return;
     final data = '$_lineCarry$chunk';
-    final parts = const LineSplitter().convert(data);
-    final endedWithNewline = data.endsWith('\n');
-    if (!endedWithNewline && parts.isNotEmpty) {
-      _lineCarry = parts.removeLast();
-    } else {
-      _lineCarry = '';
+    var start = 0;
+    for (var i = 0; i < data.length; i++) {
+      if (data.codeUnitAt(i) != 0x0A) continue;
+      // Replay each finished line so `\r` progress frames collapse into the
+      // single line a terminal would leave on screen.
+      _pushTail(normalizeTerminalText(data.substring(start, i)));
+      start = i + 1;
     }
-    for (final line in parts) {
-      _pushTail(line);
-    }
+    _lineCarry = _clampCarry(data.substring(start));
   }
 
   void _flushCarry() {
     if (_lineCarry.isEmpty) return;
-    _pushTail(_lineCarry);
+    _pushTail(normalizeTerminalText(_lineCarry));
     _lineCarry = '';
+  }
+
+  /// Keeps the raw tail of an unterminated line bounded. A repainting line
+  /// only shows its newest suffix, so the oldest bytes can be dropped.
+  String _clampCarry(String carry) {
+    if (carry.length <= maxCarryChars) return carry;
+    var cut = carry.length - maxCarryChars;
+    final unit = carry.codeUnitAt(cut);
+    if (unit >= 0xDC00 && unit <= 0xDFFF) cut += 1;
+    return carry.substring(cut);
   }
 
   void _pushTail(String line) {

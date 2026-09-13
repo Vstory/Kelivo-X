@@ -827,4 +827,31 @@ void main() {
     expect(find.byKey(kWorkspaceToolDetailDesktopKey), findsOneWidget);
     expect(find.byKey(CustomBottomSheet.panelKey), findsNothing);
   });
+
+  testWidgets('shell card preview replays carriage-return progress', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      _harness(
+        toolParts: [
+          _uiPart(
+            tool: 'shell',
+            arguments: const {'command': 'git checkout main'},
+            content: '10%\r20%\r100% done',
+            meta: const WorkspaceToolMetadata(
+              tool: 'shell',
+              status: 'ok',
+              command: 'git checkout main',
+              stdoutPreview: '10%\r20%\r100% done',
+              exitCode: 0,
+            ),
+          ),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('100% done'), findsOneWidget);
+    expect(find.textContaining('\r'), findsNothing);
+  });
 }

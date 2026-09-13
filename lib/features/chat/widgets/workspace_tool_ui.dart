@@ -24,6 +24,7 @@ import 'package:Kelivo/shared/widgets/ios_tile_button.dart';
 import 'package:Kelivo/theme/app_font_weights.dart';
 import 'package:Kelivo/theme/app_semantic_colors.dart';
 import 'package:Kelivo/utils/mcp_structured_image.dart';
+import 'package:Kelivo/utils/terminal_text.dart';
 
 import 'chat_surface.dart';
 
@@ -253,9 +254,9 @@ List<String> workspaceOutputTailLines({
   if (run != null && run.tailLines.isNotEmpty) {
     return run.tailLines;
   }
-  final preview = meta?.stdoutPreview ?? '';
-  if (preview.isNotEmpty) return const LineSplitter().convert(preview);
-  return const <String>[];
+  final preview = normalizeTerminalText(meta?.stdoutPreview ?? '');
+  if (preview.isEmpty) return const <String>[];
+  return const LineSplitter().convert(preview);
 }
 
 Color _workspaceQuietFill(BuildContext context) {
