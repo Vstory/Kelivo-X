@@ -1,0 +1,531 @@
+name: Daily Build
+
+# 移植自 RikkaHub-X 的 daily-build.yml（正式版 / 每夜版双渠道）。
+# 渠道名与 Release 页面用**同一套词汇**（Nightly Build / Release Build），使运行标题与页面可互相检索。
+# ⚠️ `A && B || C` 是 GitHub 官方三目写法，但要求 **B 必须为真值**；这里 B 是非空字符串，恒真，故安全。
+run-name: "Daily Build · ${{ inputs.build_type == 'release' && 'Release Build' || 'Nightly Build' }} · ${{ github.ref_name }}"
+
+on:
+  # 定时自动构建默认**关闭**（与 RikkaHub-X 同）。要开夜版定时，取消下面两行注释即可。
+  # schedule:
+  #   - cron: '0 9,18 * * *'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型: nightly=每夜测试版 / release=正式版'
+        required: true
+        default: nightly
+        type: choice
+        options:
+          - nightly
+          - release
+
+# 供应链加固：第三方 action 全部 pin 到 commit SHA，避免可变 tag 被上游改动/账号被盗后投毒。
+# 并发：**不设 concurrency 锁** —— 清理步骤是「保留最新 N 组」的幂等不变式，任何交错都收敛到同一稳态。
+
+env:
+  # ⚠️ 产物名前缀的**唯一来源**。它同时被三处使用：重命名 / 发布正文「最新构建」链接 / 清理步骤的匹配。
+  #    改这里即可，勿在别处再写字面量（否则链接会与真实资产名对不上 → 404）。
+  PRODUCT_PREFIX: 'Kelivo.X'
+  FLUTTER_VERSION: '3.44.9'   # 与 pubspec 的 `flutter: ">=3.44.9"` 对齐
+
+jobs:
+  # 定时触发时：过去 24 小时无新提交就跳过，避免重复打包；手动触发无条件构建。
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+
+      - name: Check for recent commits
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "手动触发 → 无条件构建"
+            exit 0
+          fi
+          if [ -n "$(git log --since='24 hours ago' --oneline)" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "过去 24 小时无新提交，跳过构建"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 发布 / 清理 Release 资产需要写权限
+
+    steps:
+      - name: 📦 检出代码
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0   # 守卫步骤要能读到 origin/main
+
+      # 正式版只允许从 main 最新提交出包 —— 否则「正式版」可能来自某个特性分支且无人知晓。
+      - name: Guard release to main's latest commit
+        if: github.event.inputs.build_type == 'release'
+        run: |
+          echo "触发 ref: ${GITHUB_REF}"
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::release 只能从 main 触发，当前是 ${GITHUB_REF}"
+            exit 1
+          fi
+          HEAD_SHA="$(git rev-parse HEAD)"
+          MAIN_SHA="$(git rev-parse origin/main)"
+          if [ "${HEAD_SHA}" != "${MAIN_SHA}" ]; then
+            echo "::error::main 已前进（检出 ${HEAD_SHA:0:8}，main 现在 ${MAIN_SHA:0:8}），请重新触发"
+            exit 1
+          fi
+          echo "✅ release 基于 main 最新提交 ${HEAD_SHA:0:8}"
+
+      - name: ☕ 配置 JDK 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 🐦 安装 Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 🗃️ Gradle 缓存
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+
+      # ⚠️ 缺 secret → **直接失败**，不静默回退到未签名产物。
+      #    Kelivo 的 android/app/build.gradle.kts 在 `key.properties` 不存在时**不设 signingConfig**，
+      #    于是 AGP 产出 `app-release-unsigned.apk` 而**构建不报错** —— 产物外观一切正常，
+      #    装到手机上才发现装不上。签名这种事一旦错了只在用户侧暴露，必须在构建期拦住。
+      #
+      # ⚠️ secret 一律经 env 传入、脚本里只引用变量名，**不把值插进 run 脚本文本**：
+      #    值里若含 $ 或反引号，插进脚本会被 shell 二次展开（RikkaHub-X 实测口令里就有 $）。
+      - name: 🔑 写入签名配置
+        env:
+          X_KEY_BASE64: ${{ secrets.KEY_BASE64 }}
+          X_SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          X_SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          X_SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          missing=""
+          for v in X_KEY_BASE64 X_SIGNING_STORE_PASSWORD X_SIGNING_KEY_ALIAS X_SIGNING_KEY_PASSWORD; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::缺少签名密钥:$missing"
+            echo "   nightly 与 release 用**同一把**密钥，故两者都需要它。"
+            echo "   拒绝回退到未签名/随机签名 —— 那会让产物与后续包无法互相覆盖安装。"
+            exit 1
+          fi
+          printf '%s' "$X_KEY_BASE64" | base64 -d > android/app/key.jks
+          # storeFile 用 runner 现场拼的绝对路径 —— 不写死仓库在 runner 上的路径名，换布局也不失配。
+          # （android/app/build.gradle.kts 里 rootProject = android/，`file(...)` 相对 android/app 解析，
+          #   故这里给绝对路径最稳。）
+          printf 'storeFile=%s\n' "$GITHUB_WORKSPACE/android/app/key.jks" > android/key.properties
+          printf 'storePassword=%s\n' "$X_SIGNING_STORE_PASSWORD" >> android/key.properties
+          printf 'keyAlias=%s\n' "$X_SIGNING_KEY_ALIAS" >> android/key.properties
+          printf 'keyPassword=%s\n' "$X_SIGNING_KEY_PASSWORD" >> android/key.properties
+          echo "✅ 签名配置已写入（channel=${{ github.event.inputs.build_type || 'nightly' }}）"
+
+      - name: 🔢 计算短提交号 / ref slug / 构建时间戳
+        id: meta
+        run: |
+          echo "short=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          # ⚠️ 分支名可能带斜杠（`fix/xxx`），而 artifact / 文件名不许有斜杠 →
+          #    凡拿 ref 去拼名字的地方一律 slug 化。
+          echo "slug=$(echo '${{ github.ref_name }}' | tr '/' '-' | tr -cd 'A-Za-z0-9._-')" >> "$GITHUB_OUTPUT"
+          NOW=$(date +%s)
+          echo "ts=$(TZ=Asia/Shanghai date -d "@$NOW" +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      - name: 📥 flutter pub get
+        run: flutter pub get
+
+      # Flutter 的 android 工程里 `fetchProot` 任务挂在 preBuild 上，会自动下载
+      # Termux proot 的 .so 到 jniLibs（这些 .so 不入库，每次构建现取）。
+      - name: 🏗️ 构建 release APK（按 ABI 拆分）
+        run: flutter build apk --release --split-per-abi
+
+      # 产物名 = `<前缀>_<北京时间>_<架构>_<渠道>_<短提交号>.apk`
+      #   · 时间戳放前部，便于肉眼按时间辨认，同一次构建的三个包相邻；
+      #   · 第三段标**渠道**而非 AGP 的变体名（否则 nightly 页面上也叫 …-release-…，看着像正式包）。
+      # ⚠️ 前缀里的点：平台在上传时会把资产名里的**空格折成点**。这里直接产出带点的名字，
+      #    让本地名与真实资产名**从一开始就一致**，拼链接无需再做 URL 编码（历史上正是
+      #    「本地名含空格 → 按本地名拼链接 → 必然 404」这个坑）。
+      - name: 🏷️ 重命名 APK（时间 + 短号 + 渠道）
+        env:
+          CHANNEL: ${{ github.event.inputs.build_type || 'nightly' }}
+        run: |
+          [ "$CHANNEL" = "release" ] || CHANNEL=nightly
+          PREFIX="${{ env.PRODUCT_PREFIX }}"
+          # 折完守一道：万一前缀被改成含非法字符，宁可在此失败，也不要产出「页面能看、链接打不开」的名字。
+          case "$PREFIX" in
+            ""|*[!A-Za-z0-9._-]*|.*|*.)
+              echo "::error::产物名前缀为空或含非法字符/以点开头结尾：'$PREFIX'（仅允许字母/数字/._-）"
+              exit 1
+              ;;
+          esac
+          echo "渠道: ${CHANNEL} · 前缀: ${PREFIX}"
+          cd build/app/outputs/flutter-apk
+          for f in *.apk; do
+            # 架构按已知集合匹配；认不出即报错 —— 否则新名字里架构段会静默变空、产物名残缺却照常发布。
+            case "$f" in
+              *arm64-v8a*)   abi=arm64-v8a ;;
+              *armeabi-v7a*) abi=armeabi-v7a ;;
+              *x86_64*)      abi=x86_64 ;;
+              *) echo "::error::无法从产物名识别架构：$f"; exit 1 ;;
+            esac
+            mv -- "$f" "${PREFIX}_${{ steps.meta.outputs.ts }}_${abi}_${CHANNEL}_${{ steps.meta.outputs.short }}.apk"
+          done
+          ls -l
+
+      # 拿**实际产出的文件名**再断言一次（用现实校验，不只信规则自洽）：
+      #   ① 数量不为 0 —— 空集会让循环整体跳过，变成「永远通过的检查」；
+      #   ② 每个名字都 URL 安全且符合文档规则。
+      - name: ✅ 断言产物命名
+        run: |
+          cd build/app/outputs/flutter-apk
+          shopt -s nullglob
+          apks=(*.apk)
+          if [ "${#apks[@]}" -eq 0 ]; then
+            echo "::error::目录里没有任何 APK —— 拒绝发布（空集不能算通过）"
+            exit 1
+          fi
+          bad=0
+          for f in "${apks[@]}"; do
+            if printf '%s' "$f" | grep -qE '^[A-Za-z0-9._-]+_[0-9]{8}-[0-9]{4}_(arm64-v8a|armeabi-v7a|x86_64)_(nightly|release)_[0-9a-f]{8}\.apk$'; then
+              echo "  ✅ ${f}"
+            else
+              echo "  ❌ 与命名规则不符（或含空格 / 百分号等 URL 不友好字符）：${f}"
+              bad=1
+            fi
+          done
+          [ "${bad}" = "0" ] || { echo "::error::拒绝发布：产物名不是 URL 安全的、或与文档规则不符。"; exit 1; }
+          echo "✅ 产物名全部符合规则且 URL 安全（${#apks[@]} 个）"
+
+      # 两条渠道各用**一个固定 tag**，下载入口长期稳定；且必须是**不同的** Release ——
+      # 共用同一个 tag 时，后一次构建的说明会整段覆盖前一次。
+      #   nightly → tag `nightly`（预发布）
+      #   release → tag `release`（预发布；本仓库是自用派生版本，不对外声称稳定正式版）
+      - name: 🎯 判定发布目标
+        id: target
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type || 'nightly' }}"
+          # 版本号从**构建产物**读（权威），读不到再退回 pubspec。
+          APK="$(ls build/app/outputs/flutter-apk/*arm64-v8a*.apk 2>/dev/null | head -1)"
+          AAPT2="$(command -v aapt2 || true)"
+          for home in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk; do
+            [ -n "$home" ] || continue
+            [ -n "$AAPT2" ] && break
+            AAPT2="$(ls -d "$home"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)"
+          done
+          FULL=""
+          if [ -n "$APK" ] && [ -n "$AAPT2" ]; then
+            FULL="$("$AAPT2" dump badging "$APK" 2>/dev/null \
+              | sed -nE "s/^package:.*versionName='([^']+)'.*/\1/p" | head -1)"
+          fi
+          if [ -z "$FULL" ]; then
+            FULL="$(sed -nE 's/^version:[[:space:]]*([^+]+).*/\1/p' pubspec.yaml | head -1)"
+            echo "⚠️ aapt2 不可用或找不到产物，版本号改从 pubspec.yaml 读取：${FULL}"
+          fi
+          echo "版本: ${FULL:-（读不到）}"
+          if [ "$BUILD_TYPE" != "release" ]; then
+            {
+              echo "tag=nightly"
+              echo "name=Nightly Build"
+              echo "prerelease=true"
+              echo "make_latest=false"
+              echo "is_nightly=true"
+              echo "channel=nightly"
+              echo "version=${FULL}"
+            } >> "$GITHUB_OUTPUT"
+            echo "nightly → 固定 tag nightly"
+            exit 0
+          fi
+          {
+            echo "tag=release"
+            echo "name=Release Build"
+            echo "prerelease=true"
+            echo "make_latest=false"
+            echo "is_nightly=false"
+            echo "channel=release"
+            echo "version=${FULL}"
+          } >> "$GITHUB_OUTPUT"
+          echo "release → 固定 tag release"
+
+      # 断言产物**确实被签名**。AGP 在 signingConfig 为空时不报错、只产出 unsigned 包；
+      # 而重命名用 `*.apk` 通配 → unsigned 包会连同正式包一起被发布，外观一切正常。
+      # 指纹比对：若仓库设了变量 CERT_SHA256 就严格比对；没设则至少断言
+      #   ① 无 unsigned 产物 ② 三个 ABI 的证书**完全一致**（能抓出「某一支用了别的密钥」）。
+      #   → 用其它密钥签出来后，把指纹填进仓库变量 CERT_SHA256 即可升级为严格比对。
+      - name: 🔒 校验签名
+        if: success()
+        env:
+          EXPECTED_SHA256: ${{ vars.CERT_SHA256 }}
+        run: |
+          if ls build/app/outputs/flutter-apk/*unsigned*.apk >/dev/null 2>&1; then
+            echo "::error::出现未签名产物，拒绝发布："
+            ls -l build/app/outputs/flutter-apk/*unsigned*.apk
+            exit 1
+          fi
+          APKSIGNER="$(command -v apksigner || true)"
+          for home in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk; do
+            [ -n "$home" ] || continue
+            [ -n "$APKSIGNER" ] && break
+            APKSIGNER="$(ls -d "$home"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)"
+          done
+          if [ -z "$APKSIGNER" ]; then
+            echo "::error::找不到 apksigner，无法断言签名 —— 拒绝发布。"
+            exit 1
+          fi
+          echo "使用 apksigner: ${APKSIGNER}"
+          norm() { tr -d ':\r\n' | tr 'a-f' 'A-F'; }
+          print_cert() {
+            "$APKSIGNER" verify --print-certs "$1" \
+              | sed -n 's/.*certificate SHA-256 digest: //p' | head -1 | norm
+          }
+          FIRST=""
+          for apk in build/app/outputs/flutter-apk/*.apk; do
+            ACTUAL="$(print_cert "$apk")"
+            # ⚠️ 先确认**真的读到了**指纹，否则「解析失败 → 空」会与「期望为空」误判为相等 → 静默通过。
+            case "$ACTUAL" in
+              [0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]*) ;;
+              *) echo "::error::读不到签名证书指纹（apksigner 未能解析 $(basename "$apk")）—— 拒绝发布。"; exit 1 ;;
+            esac
+            [ "${#ACTUAL}" -eq 64 ] || { echo "::error::指纹长度异常（${#ACTUAL}，应为 64）—— 拒绝发布。"; exit 1; }
+            if [ -z "$FIRST" ]; then
+              FIRST="$ACTUAL"
+              echo "签名证书 SHA-256: ${FIRST}"
+            elif [ "$ACTUAL" != "$FIRST" ]; then
+              echo "::error::同一批产物的签名证书不一致：$(basename "$apk") 与首批不同 —— 拒绝发布。"
+              exit 1
+            fi
+          done
+          echo "CERT_SHA256=${FIRST}" >> "$GITHUB_ENV"
+          if [ -n "${EXPECTED_SHA256:-}" ]; then
+            EXPECTED="$(printf '%s' "$EXPECTED_SHA256" | norm)"
+            [ "${#EXPECTED}" -eq 64 ] || { echo "::error::仓库变量 CERT_SHA256 长度异常（${#EXPECTED}）—— 拒绝发布。"; exit 1; }
+            if [ "$FIRST" != "$EXPECTED" ]; then
+              echo "::error::签名证书与仓库变量 CERT_SHA256 不一致 —— 产物不是用固定密钥签的，用户将无法覆盖升级。"
+              exit 1
+            fi
+            echo "✅ 签名与仓库变量 CERT_SHA256 一致"
+          else
+            echo "::notice::未设置仓库变量 CERT_SHA256 → 本期只断言「已签名 + 各 ABI 证书一致」；建议把上面的指纹填进去以启用严格比对。"
+          fi
+
+      # 断言**产物里的包名**符合预期。Kelivo 没有渠道 flavor（nightly 与正式版同包名），
+      # 故这里只钉死唯一合法值 —— 一旦将来引入 flavor，这条会立刻提醒你同步改。
+      - name: 📛 断言包名
+        if: success()
+        run: |
+          AAPT2="$(command -v aapt2 || true)"
+          for home in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk; do
+            [ -n "$home" ] || continue
+            [ -n "$AAPT2" ] && break
+            AAPT2="$(ls -d "$home"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)"
+          done
+          [ -n "$AAPT2" ] || { echo "::error::找不到 aapt2，无法断言包名 —— 拒绝发布。"; exit 1; }
+          APK="$(ls build/app/outputs/flutter-apk/*arm64-v8a*.apk | head -1)"
+          PKG="$("$AAPT2" dump badging "$APK" 2>/dev/null | sed -nE "s/^package: name='([^']+)'.*/\1/p" | head -1)"
+          echo "产物包名: ${PKG:-（读不到）}"
+          [ "$PKG" = "com.psyche.kelivo" ] || { echo "::error::包名不是 com.psyche.kelivo（实为 '${PKG}'）—— 拒绝发布。"; exit 1; }
+          echo "✅ 包名正确"
+
+      # 发布正文：**最新构建置顶由正文承担** —— GitHub 不支持控制资产显示顺序
+      # （资产列表始终按上传顺序旧→新排列，文件名排序改变不了它）。
+      - name: 📝 生成发布正文（新 → 旧）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          IS_NIGHTLY: ${{ steps.target.outputs.is_nightly }}
+          TARGET_TAG: ${{ steps.target.outputs.tag }}
+          VERSION: ${{ steps.target.outputs.version }}
+          CHANNEL: ${{ steps.target.outputs.channel }}
+        run: |
+          TS="${{ steps.meta.outputs.ts }}"
+          SHA="${{ steps.meta.outputs.short }}"
+          PREFIX="${{ env.PRODUCT_PREFIX }}"
+          BASE="https://github.com/${REPO}/releases/download/${TARGET_TAG}"
+          PRETTY="${TS:0:4}-${TS:4:2}-${TS:6:2} ${TS:9:2}:${TS:11:2}"
+          abi_label() {
+            case "$1" in
+              arm64-v8a)   echo "真机（绝大多数手机）" ;;
+              armeabi-v7a) echo "老旧 32 位设备" ;;
+              x86_64)      echo "模拟器 / x86_64" ;;
+            esac
+          }
+          BODY="${GITHUB_WORKSPACE}/release_body.md"
+          cd build/app/outputs/flutter-apk
+          {
+            if [ "$IS_NIGHTLY" = "true" ]; then
+              echo "> [!CAUTION]"
+              echo "> **本页面为自动构建的开发测试版，功能不稳定，仅供开发者测试功能使用，请勿下载。**"
+            else
+              echo "> [!CAUTION]"
+              echo "> **本页面为自动构建的尝鲜版，功能仍在快速迭代，仅供尝鲜体验，请勿用于重要场景。**"
+            fi
+            echo
+            echo "自动构建 · \`${VERSION}\` · commit [\`${SHA}\`](https://github.com/${REPO}/commit/${{ github.sha }})"
+            echo
+            echo "## 📥 最新构建 · ${PRETTY}（北京时间）"
+            echo
+            echo "| 架构 | 适用 | 下载 |"
+            echo "|---|---|---|"
+            for abi in arm64-v8a armeabi-v7a x86_64; do
+              f="${PREFIX}_${TS}_${abi}_${CHANNEL}_${SHA}.apk"
+              if [ -f "$f" ]; then
+                mb="$(awk -v b="$(stat -c %s "$f")" 'BEGIN{printf "%.1f", b/1048576}')"
+                echo "| \`${abi}\` | $(abi_label "$abi") | [⬇ 下载 ${mb} MB](${BASE}/${f}) |"
+              fi
+            done
+            echo
+            echo "> 🔒 固定密钥签名，每次构建签名相同 → 可直接**覆盖升级**（无需卸载旧版）。"
+            echo ">"
+            if [ "$IS_NIGHTLY" = "true" ]; then
+              echo "> ⚠️ 本版与正式版**同包名**（\`com.psyche.kelivo\`）→ 两者**不能共存**，装本版会覆盖正式版。"
+              echo ">"
+            fi
+            echo "> 签名证书 SHA-256：\`${CERT_SHA256}\`，装前可与本地包比对确认。"
+            echo
+          } > "$BODY"
+
+          # 历史构建：从**本渠道**已有资产名解析出 (时间戳, 短号, 架构, 真实文件名)，去重后倒序 → 新在前。
+          # ⚠️ 必须用 ${TARGET_TAG}：若写死 nightly，正式版页面会列出 nightly 的产物，而链接按 release 拼 → 全 404。
+          # ⚠️ 链接直接用**API 返回的真实资产名**，不按规则重建（重建容易把渠道段写错 → 404）。
+          # ⚠️ 字段分隔符用 `|`：文件名含点/短横，用空格切字段会把文件名切碎。
+          mapfile -t PREV_ROWS < <(gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${REPO}/releases/tags/${TARGET_TAG}" \
+            --jq '.assets[].name' 2>/dev/null \
+            | sed -nE 's/^(.*)_([0-9]{8}-[0-9]{4})_(arm64-v8a|armeabi-v7a|x86_64)_(nightly|release)_([0-9a-f]{8})\.apk$/\2|\5|\3|&/p' \
+            | sort -u -r)
+          declare -A HIST_FILE=()
+          HIST_KEYS=()
+          for row in "${PREV_ROWS[@]}"; do
+            [ -n "$row" ] || continue
+            IFS='|' read -r h_ts h_sha h_abi h_full <<< "$row"
+            [ -n "$h_full" ] || continue
+            h_key="${h_ts} ${h_sha}"
+            HIST_FILE["${h_key}|${h_abi}"]="$h_full"
+            case " ${HIST_KEYS[*]} " in
+              *" ${h_key} "*) ;;
+              *) HIST_KEYS+=("$h_key") ;;
+            esac
+          done
+          if [ "${#HIST_KEYS[@]}" -gt 0 ]; then
+            {
+              echo "## 🕘 历史构建（新 → 旧）"
+              echo
+            } >> "$BODY"
+            n=0
+            for h_key in "${HIST_KEYS[@]}"; do
+              [ "$n" -lt 6 ] || break
+              h_ts="${h_key%% *}"
+              h_sha="${h_key##* }"
+              h_pretty="${h_ts:0:4}-${h_ts:4:2}-${h_ts:6:2} ${h_ts:9:2}:${h_ts:11:2}"
+              links=""
+              for abi in arm64-v8a armeabi-v7a x86_64; do
+                f="${HIST_FILE["${h_key}|${abi}"]:-}"
+                [ -n "$f" ] || continue
+                if [ -n "$links" ]; then links="${links} · "; fi
+                links="${links}[\`${abi}\`](${BASE}/${f})"
+              done
+              [ -n "$links" ] || continue
+              {
+                echo "**${h_pretty}** · \`${h_sha}\`"
+                echo
+                echo "${links}"
+                echo
+              } >> "$BODY"
+              n=$((n + 1))
+            done
+          fi
+          echo "--- 正文预览 ---"
+          head -40 "$BODY"
+
+      - name: 🚀 发布
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        if: success()
+        with:
+          tag_name: ${{ steps.target.outputs.tag }}
+          name: ${{ steps.target.outputs.name }}
+          prerelease: ${{ steps.target.outputs.prerelease }}
+          make_latest: ${{ steps.target.outputs.make_latest }}
+          body_path: release_body.md
+          files: build/app/outputs/flutter-apk/*.apk
+
+      # 保留最近 6 次构建，其余删除。
+      # ⚠️ 用「幂等不变式」而非「总数 - N」计数法：计数法基于某一时刻快照，并发构建会**多删**
+      #    （A 见 24 个→删 6；B 见 21 个→再删 3；最终只剩 15 而非 18），且重复删除返回 404 →
+      #    xargs 退出码非 0 → 步骤误报失败。不变式的性质：① 任何交错都收敛到同一稳态；
+      #    ② **最新构建必然落在保留集内 → 永不删到更新的产物**；③ 重复删除按 404 容忍。
+      - name: 🧹 清理旧资产（保留最新 6 组）
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          sleep 30   # 等本次上传的资产在 API 中可见
+          mapfile -t ASSETS < <(gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${{ github.repository }}/releases/tags/${TARGET_TAG}" \
+            --jq '.assets[] | select(.name | test("[-_][0-9a-f]{8}\\.apk$")) | [.id, .name] | @tsv')
+          echo "匹配命名规则的资产共 ${#ASSETS[@]} 个"
+          key_of() {
+            sed -nE 's/^(.*)_([0-9]{8}-[0-9]{4})_(arm64-v8a|armeabi-v7a|x86_64)_(nightly|release)_([0-9a-f]{8})\.apk$/\2 \5/p' <<< "$1"
+          }
+          KEYS_FILE="$(mktemp)"
+          while IFS=$'\t' read -r _id name; do
+            [ -n "$name" ] || continue
+            key_of "$name"
+          done < <(printf '%s\n' "${ASSETS[@]}") | sort -u -r > "$KEYS_FILE"
+          declare -A KEEP=()
+          kept=0
+          while read -r k; do
+            [ -n "$k" ] || continue
+            [ "$kept" -lt 6 ] || break
+            KEEP["$k"]=1
+            kept=$((kept + 1))
+          done < "$KEYS_FILE"
+          echo "保留最新 ${kept} 组构建"
+          deleted=0
+          failed=0
+          while IFS=$'\t' read -r id name; do
+            [ -n "$id" ] || continue
+            k="$(key_of "$name")"
+            if [ -n "$k" ] && [ -n "${KEEP[$k]:-}" ]; then
+              continue
+            fi
+            if gh api -X DELETE -H "Accept: application/vnd.github+json" \
+                 "repos/${{ github.repository }}/releases/assets/$id" >/dev/null 2>&1; then
+              deleted=$((deleted + 1))
+            else
+              failed=$((failed + 1))
+            fi
+          done < <(printf '%s\n' "${ASSETS[@]}")
+          rm -f "$KEYS_FILE"
+          echo "已删除 ${deleted} 个旧资产"
+          if [ "$failed" -gt 0 ]; then
+            echo "::notice::${failed} 个资产删除失败（并发下被另一次运行抢先删除会返回 404，属正常，不影响收敛结果）"
+          fi
+
+      - name: 📤 上传 artifact（备份取件用）
+        if: success()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kelivo-x-${{ steps.target.outputs.channel }}-${{ steps.meta.outputs.ts }}
+          path: build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
