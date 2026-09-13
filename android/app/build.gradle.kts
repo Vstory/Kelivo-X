@@ -6,6 +6,15 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// ── Kelivo X 渠道定制（自用 fork）────────────────────────────────────────────
+// 渠道由 CI 写入 android/gradle.properties 的 `x.channel=nightly|release`（缺省 = release）。
+// 目的：nightly 与正式版**彼此独立包名**，可同机共存（与官方 Kelivo 也互不冲突）。
+//   release → com.psyche.kelivo.x          应用名 "Kelivo X"
+//   nightly → com.psyche.kelivo.x.nightly  应用名 "Kelivo X Nightly"
+// ⚠️ `namespace`（Kotlin 包名/R 类）**不变**，只改 applicationId —— 故代码零改动。
+val xChannel = (project.findProperty("x.channel") as String?)?.lowercase() ?: "release"
+val xIsNightly = xChannel == "nightly"
+
 android {
     namespace = "com.psyche.kelivo"
     compileSdk = flutter.compileSdkVersion
@@ -17,8 +26,10 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.psyche.kelivo"
+        // Kelivo X：正式版与 nightly 各自独立包名（见上方渠道说明）
+        applicationId = if (xIsNightly) "com.psyche.kelivo.x.nightly" else "com.psyche.kelivo.x"
+        // 应用名按渠道生成（Manifest 用 @string/app_name 引用），随包名一起区分，避免两个图标同名难辨
+        resValue("string", "app_name", if (xIsNightly) "Kelivo X Nightly" else "Kelivo X")
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
