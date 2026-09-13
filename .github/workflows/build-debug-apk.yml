@@ -1,0 +1,93 @@
+name: Build Debug APK
+
+# 用途：在 fork 上构建可直接安装的 debug APK（debug 自带签名，无需 keystore secret）
+# 触发：手动 workflow_dispatch；产物同时作为 Actions artifact + 发布到 fork 的 Release（固定 tag debug-latest，可覆盖）
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: '发布到本仓库 Release（tag: debug-latest）'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  FLUTTER_VERSION: '3.44.9'
+
+jobs:
+  debug-apk:
+    name: 构建 debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📦 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: ☕ 配置 Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 🐦 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      # lib/secrets/fallback.dart 已入库（占位值 sk-xxxx），此步仅为防御性兜底，
+      # 避免空 SILICONFLOW_KEY 注入覆盖真实占位、导致 CI 日志里出现凭证相关内容。
+      - name: 🛡️ 确认 fallback 占位存在
+        shell: bash
+        run: |
+          mkdir -p lib/secrets
+          if [ ! -f lib/secrets/fallback.dart ]; then
+            printf "const String siliconflowFallbackKey = 'sk-xxxx';\n" > lib/secrets/fallback.dart
+            echo "已补建 fallback.dart 占位"
+          else
+            echo "fallback.dart 已存在，保持原样（不注入任何密钥）"
+          fi
+
+      - name: 📝 记录构建信息
+        run: |
+          echo "上游提交: $(git rev-parse HEAD)"
+          echo "应用版本: $(grep '^version:' pubspec.yaml)"
+
+      - name: 📥 flutter pub get
+        run: flutter pub get
+
+      - name: 🏗️ 构建 debug APK（按 ABI 拆分）
+        run: flutter build apk --debug --split-per-abi
+
+      - name: 📋 列出产物
+        run: ls -lh build/app/outputs/flutter-apk/
+
+      - name: ⬆️ 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kelivo-x-debug-apk
+          path: build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+
+      - name: 🚀 发布到 Release
+        if: ${{ github.event.inputs.publish_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: debug-latest
+          name: Kelivo-X Debug Build
+          prerelease: true
+          body: |
+            Kelivo-X 调试构建（debug 签名，可直接安装）
+
+            - 上游基线：`${{ github.sha }}`
+            - 上游版本：1.2.7+76
+            - 构建模式：`flutter build apk --debug --split-per-abi`
+
+            安装 arm64-v8a 那个即可（绝大多数手机）。
+          files: build/app/outputs/flutter-apk/*.apk
