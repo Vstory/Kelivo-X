@@ -153,6 +153,19 @@ jobs:
       - name: 📥 flutter pub get
         run: flutter pub get
 
+      # 渠道写进 android/gradle.properties，供 android/app/build.gradle.kts 读取（缺省 = release）。
+      # 用它决定 applicationId（正式版 .x / nightly .x.nightly）与应用名 —— 使两渠道可同机共存。
+      - name: 🏷️ 写入渠道属性
+        env:
+          CHANNEL: ${{ github.event.inputs.build_type || 'nightly' }}
+        run: |
+          [ "$CHANNEL" = "release" ] || CHANNEL=nightly
+          # 幂等：先删旧行再追加（重复写入会让同名属性出现多行，后者覆盖前者，隐式行为难排查）
+          sed -i '/^x\.channel=/d' android/gradle.properties
+          printf 'x.channel=%s\n' "$CHANNEL" >> android/gradle.properties
+          echo "已写入 android/gradle.properties:"
+          tail -2 android/gradle.properties
+
       # Flutter 的 android 工程里 `fetchProot` 任务挂在 preBuild 上，会自动下载
       # Termux proot 的 .so 到 jniLibs（这些 .so 不入库，每次构建现取）。
       - name: 🏗️ 构建 release APK（按 ABI 拆分）
@@ -326,10 +339,17 @@ jobs:
             echo "::notice::未设置仓库变量 CERT_SHA256 → 本期只断言「已签名 + 各 ABI 证书一致」；建议把上面的指纹填进去以启用严格比对。"
           fi
 
-      # 断言**产物里的包名**符合预期。Kelivo 没有渠道 flavor（nightly 与正式版同包名），
-      # 故这里只钉死唯一合法值 —— 一旦将来引入 flavor，这条会立刻提醒你同步改。
-      - name: 📛 断言包名
+      # 断言**产物里的包名**与渠道相符。
+      #
+      # 为什么必须在**产物**上断言，而不是只看 build.gradle.kts：
+      #   nightly 的独立包名是靠 `if (xIsNightly) "…x.nightly"` 实现的 —— 一旦那个条件被改坏、
+      #   或 CI 忘了写 `x.channel`，**产物包名会静默退回正式版**，而构建日志里毫无异常
+      #   （编译 / 签名 / 命名全过）。后果：nightly 覆盖到正式版上（以为在试新功能，其实替换了正式包）。
+      #   这与签名断言合起来才保证「装得上、升得动、不互相踩」。
+      - name: 📛 断言包名与渠道相符
         if: success()
+        env:
+          IS_NIGHTLY: ${{ steps.target.outputs.is_nightly }}
         run: |
           AAPT2="$(command -v aapt2 || true)"
           for home in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk; do
@@ -341,8 +361,10 @@ jobs:
           APK="$(ls build/app/outputs/flutter-apk/*arm64-v8a*.apk | head -1)"
           PKG="$("$AAPT2" dump badging "$APK" 2>/dev/null | sed -nE "s/^package: name='([^']+)'.*/\1/p" | head -1)"
           echo "产物包名: ${PKG:-（读不到）}"
-          [ "$PKG" = "com.psyche.kelivo" ] || { echo "::error::包名不是 com.psyche.kelivo（实为 '${PKG}'）—— 拒绝发布。"; exit 1; }
-          echo "✅ 包名正确"
+          if [ "$IS_NIGHTLY" = "true" ]; then EXPECT="com.psyche.kelivo.x.nightly"; else EXPECT="com.psyche.kelivo.x"; fi
+          echo "本渠道期望包名: ${EXPECT}"
+          [ "$PKG" = "$EXPECT" ] || { echo "::error::包名不符（期望 '${EXPECT}'，实为 '${PKG}'）—— 拒绝发布。"; exit 1; }
+          echo "✅ 包名与渠道相符"
 
       # 发布正文：**最新构建置顶由正文承担** —— GitHub 不支持控制资产显示顺序
       # （资产列表始终按上传顺序旧→新排列，文件名排序改变不了它）。
@@ -392,12 +414,16 @@ jobs:
               fi
             done
             echo
-            echo "> 🔒 固定密钥签名，每次构建签名相同 → 可直接**覆盖升级**（无需卸载旧版）。"
+            echo "> 🔒 固定密钥签名，本渠道每次构建签名相同 → 可直接**覆盖升级**（无需卸载旧版）。"
             echo ">"
             if [ "$IS_NIGHTLY" = "true" ]; then
-              echo "> ⚠️ 本版与正式版**同包名**（\`com.psyche.kelivo\`）→ 两者**不能共存**，装本版会覆盖正式版。"
-              echo ">"
+              echo "> 📦 包名 \`com.psyche.kelivo.x.nightly\`，应用名 **Kelivo X Nightly** ——"
+              echo "> 与正式版、与官方 Kelivo **互不冲突，可同机共存**（第一次从旧包迁过来仍需卸载一次，数据会清）。"
+            else
+              echo "> 📦 包名 \`com.psyche.kelivo.x\`，应用名 **Kelivo X** ——"
+              echo "> 与官方 Kelivo **互不冲突，可同机共存**（不是官方版的升级包，装它不会动官方版的数据）。"
             fi
+            echo ">"
             echo "> 签名证书 SHA-256：\`${CERT_SHA256}\`，装前可与本地包比对确认。"
             echo
           } > "$BODY"
