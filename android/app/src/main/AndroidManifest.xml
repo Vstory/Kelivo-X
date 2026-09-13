@@ -37,8 +37,10 @@
          family (db without -wal, receipt without db), which the fail-closed
          startup gate rejects. Kelivo ships its own backup (WebDAV/S3/local
          export), so system backup is disabled. -->
+    <!-- Kelivo X：应用名按渠道取值（release = "Kelivo X" / nightly = "Kelivo X Nightly"），
+         值由 android/app/build.gradle.kts 的 resValue("string","app_name", …) 生成。 -->
     <application
-        android:label="Kelivo"
+        android:label="@string/app_name"
         android:name=".KelivoApplication"
         android:allowBackup="false"
         android:fullBackupContent="false"
